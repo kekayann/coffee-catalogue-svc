@@ -1,0 +1,93 @@
+name: Correct error files using AI service
+
+on:
+  workflow_dispatch:
+    inputs:
+      logs:
+        description: 'Logs to send'
+        required: true
+env:
+  API_URL: https://007c-111-118-199-2.ngrok-free.app
+  LOGS: ${{ github.event.inputs.logs }}
+
+jobs:
+  send-logs-and-modify-file:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install jq
+        run: sudo apt-get install jq
+
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get file paths
+        id: get-file-paths
+        run: |
+          files="$(git ls-files -z | tr '\0' ,)"
+          echo "::set-output name=file-paths::$files"
+
+      - name: Send logs to API
+        id: send-logs
+        env:
+          API_URL: ${{env.API_URL}}/identify-files/
+          LOGS: ${{ env.LOGS }}
+          FILE_PATHS: ${{ steps.get-file-paths.outputs.file-paths }}
+        run: |
+          payload=$(jq -n --arg logs "$LOGS" --arg file_paths "$FILE_PATHS" '{"error_message": $logs, "available_files": $file_paths}')
+          echo "payload: $payload"
+          response=$(curl -X POST -H 'accept: application/json' -H "Content-Type: application/json" -d "$payload" "$API_URL")
+          echo "Response: $response"
+          identifiedFiles=$(echo "$response" | jq -r '.identified_files')
+          echo "::set-output name=identified-files::$identifiedFiles"
+
+      - name: Create new branch
+        run: git checkout -b fix-issue-${{ github.run_id }}
+
+      - name: Send file to API
+        id: send-file
+        env:
+          API_URL: ${{env.API_URL}}/correct-errors/
+          FILE_NAME: ${{ steps.send-logs.outputs.identified-files }}
+          FILE_PATH: ${{ steps.send-logs.outputs.identified-files }}
+          LOGS: ${{ env.LOGS }}
+        run: |
+          file_content=$(cat "$FILE_PATH")
+          payload=$(jq -n --arg fileName "$FILE_NAME" --arg fileContent "$file_content" --arg logs "$LOGS" '{"file_contents": {($fileName): $fileContent}, "error_message": $logs}')
+          echo "payload: $payload"
+          response=$(curl -X POST -H 'accept: application/json' -H "Content-Type: application/json" -d "$payload" "$API_URL")
+          echo "response: $response"
+          correction_files=$(echo "${response}" | jq -r '.corrected_files')
+          # Loop through the JSON object
+          echo "${correction_files}" | jq -r 'to_entries[] | @base64' | while read -r line; do
+              # Decode the base64 to get the original JSON string
+              decoded=$(echo "${line}" | base64 --decode)
+              # Extract the key (filename) and value (file content) using jq
+              key=$(echo "${decoded}" | jq -r '.key')
+              value=$(echo "${decoded}" | jq -r '.value')
+              # Use the key as the filename and the value as the content, writing to the file
+              echo "${value}" > "${key}"
+              echo "Written to ${key}"
+          done
+          echo "All files have been created."
+
+      - name: Commit changes
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git add .
+          git commit -m "fix issue"
+
+      - name: Push changes
+        run: git push origin fix-issue-${{ github.run_id }}
+      
+      - name: Create Pull Request
+        uses: repo-sync/pull-request@v2
+        with:
+          source_branch: "fix-issue-${{ github.run_id }}"
+          destination_branch: "main"
+          pr_title: "Fix Issue-${{ github.run_id }}"
+          pr_body: |
+            This pull request fixes the error contained in the logs.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
